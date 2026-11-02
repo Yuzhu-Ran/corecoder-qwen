@@ -1,10 +1,12 @@
-# AI 编程助手 · CoreCoder 个人实践版
+# AI 编程助手 · LangChain / LangGraph 实践版
 
 一个在终端里运行的 AI Coding Agent。输入开发任务后，它可以查找代码、读取文件、提出修改、执行命令，再根据结果继续处理。当前本地接入阿里云百炼的 `qwen-flash`，也可以切换到其他支持工具调用的 OpenAI 兼容模型服务。
 
 这个项目是我基于 [CoreCoder](https://github.com/he-yufeng/CoreCoder) 做的编程 Agent 复现与实践。我想通过一个能实际运行的项目，理解 Claude Code 这类工具如何把自然语言需求变成具体操作，以及用户应该在哪些环节介入。
 
-代码基础来自 CoreCoder，Agent Loop、工具系统、上下文管理、Sub-agent、MCP 等机制沿用其实现。目前的个人实践包括本地环境配置、Qwen 接入、双击启动入口，以及对运行过程和产品设计的梳理。下文会分别说明项目已有能力、本地已验证的部分和后续计划。
+本版本以 CoreCoder 0.8.0 为代码基础，在 0.9.0 中把执行核心迁移到 LangChain 和 LangGraph：模型请求经由 `ChatOpenAI`，工具包装为 `StructuredTool`，主循环由 `StateGraph` 调度。原有文件操作、权限、Hooks、上下文压缩、文件撤销、子 Agent 和 JSON 会话接口继续保留。
+
+这次个人实践包括框架迁移、Qwen 接入、工具适配、关键回归验证和 Mac 启动入口。下文分别说明已经实现的部分、验证记录和后续计划。
 
 ## 1. 这个项目解决什么问题
 
@@ -24,7 +26,10 @@
 
 | 项目 | 当前情况 |
 | --- | --- |
-| 代码基础 | CoreCoder 0.8.0 |
+| 代码基础 | CoreCoder 0.8.0，保留原作者 MIT 许可 |
+| 当前版本 | 0.9.0，LangChain / LangGraph 迁移版 |
+| 模型与工具层 | LangChain `ChatOpenAI`、`StructuredTool` |
+| 执行流程 | LangGraph `StateGraph`，六个执行节点 |
 | 使用方式 | 命令行交互、一次性任务、Python 库调用 |
 | 本地模型 | 阿里云百炼 `qwen-flash` |
 | 模型接口 | OpenAI Chat Completions 兼容接口 |
@@ -32,13 +37,15 @@
 | 配置方式 | 项目根目录 `.env`，密钥不写入源码和文档 |
 | 启动入口 | `启动 CoreCoder.command` 或 `corecoder` 命令 |
 
-本次实践已经完成：
+本次迁移已经完成：
 
-- 安装并检查运行依赖，确认命令行入口可用。
-- 配置百炼接口、API Key 和 `qwen-flash`，通过实际请求确认模型可调用。
-- 使用只返回固定文本的测试工具，跑通模型请求工具、执行工具、回传结果、模型回答的完整调用过程。
-- 增加 Mac 双击启动项，自动进入项目目录并使用项目的 Python 环境。
-- 整理项目架构、使用方式、产品交互、实现边界和参考资料。
+- 将原生 Python 主循环改为 LangGraph 图，保留 `Agent.chat()`、消息历史和 CLI 的使用方式。
+- 使用 LangChain 绑定工具和接收模型流式响应，并兼容现有 Qwen 配置。
+- 将内置工具和 MCP 动态工具包装为 `StructuredTool`，实际通过 `.invoke()` 执行。
+- 在图中保留计划模式、操作授权、Hooks、文件快照和上下文压缩，补充迁移回归测试。
+- 保留双击启动入口，并同步更新运行说明、架构讲解和实现边界。
+
+迁移后的真实 Qwen 调用和固定文本工具链已经跑通；自动化测试与验证范围见第 9 节。
 
 ## 3. 启动与模型配置
 
@@ -75,6 +82,8 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
+已经安装过 0.8.0 的环境也需要再执行一次 `python -m pip install -e .`，以安装新增的 LangChain、LangGraph 依赖并更新版本信息。
+
 运行测试或离线测试演示时，额外安装开发依赖：
 
 ```bash
@@ -88,6 +97,7 @@ python -m pip install -e ".[dev]"
 在项目根目录新建 `.env`，与 `pyproject.toml` 放在同一层。Mac Finder 默认隐藏点开头的文件，可按 `Command + Shift + .` 显示。
 
 ```dotenv
+CORECODER_PROVIDER=langchain
 CORECODER_MODEL=qwen-flash
 CORECODER_API_KEY=your-api-key
 OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -99,13 +109,23 @@ OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 
 | 配置项 | 作用 |
 | --- | --- |
+| `CORECODER_PROVIDER` | 模型适配后端，默认 `langchain`；兼容值见下表 |
 | `CORECODER_MODEL` | 模型名称，当前为 `qwen-flash` |
 | `CORECODER_API_KEY` | 模型服务密钥；也兼容读取 `OPENAI_API_KEY`、`DEEPSEEK_API_KEY` |
 | `OPENAI_BASE_URL` | OpenAI 兼容接口地址；也支持 `CORECODER_BASE_URL` |
 | `CORECODER_MAX_TOKENS` | 单次请求的输出上限，默认 4096 |
 | `CORECODER_MAX_CONTEXT` | 上下文压缩使用的窗口配置，默认 128000 |
 
-`DASHSCOPE_API_KEY` 和 `QWEN_MODEL` 不是当前程序直接读取的变量名，需要按上表填写。这里使用 `openai` SDK 作为兼容客户端，实际模型请求发往配置的百炼地址。
+`DASHSCOPE_API_KEY` 和 `QWEN_MODEL` 不是当前程序直接读取的变量名，需要按上表填写。默认由 LangChain 的 `ChatOpenAI` 使用兼容接口请求模型，实际网络地址仍为 `.env` 中配置的百炼地址。
+
+| `CORECODER_PROVIDER` | 使用方式 |
+| --- | --- |
+| `langchain` | 默认路径，使用 `LangChainLLM` / `ChatOpenAI` |
+| `openai` | 保留的兼容别名，也使用 LangChain 默认路径 |
+| `legacy` | 使用原来的 `LLM`，保留直接 OpenAI 兼容 SDK 调用方式 |
+| `litellm` | 使用原有可选 LiteLLM 后端，需安装 `corecoder[litellm]` |
+
+以上选项切换的是模型适配后端。Agent 主流程仍由 LangGraph 调度，文件工具仍经 LangChain 工具适配执行。
 
 对于同名变量，终端中已存在的值优先于 `.env`；命令行参数可以覆盖最后读取的配置。如果修改 `.env` 后没有生效，先检查终端里是否还保留了同名变量，再退出并重新启动。代码中的原始模型默认值仍为 `gpt-5.5`，本地通过 `.env` 覆盖。
 
@@ -113,16 +133,17 @@ OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 
 ```mermaid
 flowchart TD
-    A[用户输入任务] --> B[Agent 组织对话和工具定义]
-    B --> C[请求 Qwen 模型]
-    C --> D{是否请求工具}
-    D -- 否 --> I[返回回答]
-    D -- 是 --> E[前置 Hooks 与权限检查]
-    E -- 允许 --> F[执行内置工具或 MCP 工具]
-    E -- 拒绝 --> G[把拒绝原因作为工具结果]
-    F --> H[记录结果并按需压缩上下文]
-    G --> H
-    H --> B
+    A[用户输入任务] --> P[prepare：准备历史并检查上下文]
+    P --> R{模型轮次是否用完}
+    R -- 否 --> M[model：绑定工具并请求模型]
+    R -- 是 --> L[limit：返回轮次上限提示]
+    M --> D{是否请求工具}
+    D -- 否 --> E[结束并返回回答]
+    D -- 是 --> U[authorize：运行前置 Hooks 并检查许可]
+    U --> T[tools：执行允许的调用或回传拒绝原因]
+    T --> C[compact：按需压缩并更新历史]
+    C --> R
+    L --> E
 ```
 
 例如，“给一个函数补上异常处理并运行测试”可能按下面的顺序完成：
@@ -137,11 +158,32 @@ flowchart TD
 
 ## 5. 核心模块与技术实现
 
-### Agent Loop 与 Tool Calling
+### LangGraph 执行图
 
-[agent.py](corecoder/agent.py) 保存对话历史，向模型提供工具定义，并执行模型返回的工具调用。主 Agent 默认最多进行 50 轮交互，工具异常通常转换成错误文本返回模型。
+[agent.py](corecoder/agent.py) 中的 `Agent.graph` 是编译后的 `StateGraph`。`Agent.chat()` 负责接收任务，再调用图执行；外部仍可通过 `agent.messages` 访问 OpenAI 格式的字典消息，原有 CLI、JSON 存档与上下文压缩接口可继续使用。
 
-模型同一轮返回多个调用时，程序使用最多 8 个线程执行。当前是在本轮模型响应接收完成后批量执行，没有通用的任务依赖调度，也没有实现一边生成工具参数、一边开始执行的流式调度。
+图中定义了六个节点：
+
+| 节点 | 职责 |
+| --- | --- |
+| `prepare` | 接入当前消息历史，先检查是否需要压缩 |
+| `model` | 组织系统提示词、调用模型，记录响应和模型轮次 |
+| `authorize` | 展示调用信息，依次处理前置 Hook、计划模式和权限 |
+| `tools` | 执行获准工具，或把拒绝原因作为工具结果回传 |
+| `compact` | 在工具结果写回后检查上下文长度 |
+| `limit` | 达到本轮模型调用预算后返回提示 |
+
+主 Agent 默认最多执行 50 次模型节点，图的递归上限按节点数量调整，避免把“50 轮模型调用”误当作“50 次图节点执行”。上下文生成摘要时可能另有模型请求。
+
+Bash 跟踪的工作目录会显式写入图状态，在图节点与工具线程之间传递，使前一轮的 `cd` 能影响后续 Bash 调用。工具异常通常转换为文本结果；`Ctrl + C` 中断时，会补齐未完成的工具回复，维持后续消息格式有效。
+
+模型同一轮返回多个调用时，工具执行仍使用最多 8 个线程。当前是在本轮模型响应接收完成后批量执行，没有通用的任务依赖调度，也没有实现一边生成工具参数、一边开始执行的流式调度。
+
+### LangChain 工具适配
+
+[langchain_tools.py](corecoder/langchain_tools.py) 将原工具包装为 `StructuredTool`，保留名称、描述和 JSON Schema。图中的工具节点实际调用适配对象的 `.invoke()`，再由它调用原来的 `execute()`；文件读写等具体业务逻辑没有重复实现。
+
+适配层使用 Python 签名检查缺失或多余参数，不对完整 JSON Schema 另加运行时类型校验，也不自动转换参数类型。MCP 工具的动态字段会原样传递给服务，由工具实现或远端完成具体语义校验。权限和 Hooks 仍由工具节点外层的调度逻辑控制。
 
 ### 八个内置工具
 
@@ -156,13 +198,15 @@ flowchart TD
 | `todo_write` | 维护任务清单，并在后续请求中展示 | [todo.py](corecoder/tools/todo.py) |
 | `agent` | 运行子 Agent 并返回结果 | [agent.py](corecoder/tools/agent.py) |
 
-工具在 [tools/__init__.py](corecoder/tools/__init__.py) 中统一注册。读取和搜索都有输出或扫描上限，大型仓库的结果可能不完整。
+工具在 [tools/__init__.py](corecoder/tools/__init__.py) 中统一注册，再交给 LangChain 适配层。读取和搜索都有输出或扫描上限，大型仓库的结果可能不完整。
 
 ### 模型接入
 
-[llm.py](corecoder/llm.py) 负责流式响应、工具参数拼接、部分接口参数适配、异常重试和 Token 统计。网络连接失败、限流和部分服务端错误会触发重试；业务错误不会全部重试。
+[langchain_llm.py](corecoder/langchain_llm.py) 提供默认的 `LangChainLLM`。有工具时，通过 `ChatOpenAI.bind_tools()` 绑定定义，再通过 `.stream()` 接收响应，将文本、工具调用和 usage 转回项目原有的 `LLMResponse` 接口。
 
-默认客户端面向 OpenAI 兼容接口。可选的 LiteLLM 后端用于接入其他服务，当前本地 Qwen 配置未使用该后端。
+这一层保留流式输出、Token 统计和有上限的异常重试：最多两次瞬时错误重试，另有最多三次参数兼容调整，最坏共六次请求。共享模型对象的客户端缓存与 Token 更新使用锁保护，网络请求仍可并行。CLI 的 `/model` 或恢复会话修改模型名称后，下一次请求会按新配置创建或复用合适的客户端。
+
+[llm.py](corecoder/llm.py) 中原来的 `LLM` 和 `LiteLLM` 保留为兼容路径，同时提供响应类型和费用统计。第三方接口的非标准思考字段是否可显示，取决于 LangChain 是否保留这些字段；有特定接口方言需求时，可以选择 `legacy` 路径。
 
 ### 上下文管理
 
@@ -178,9 +222,11 @@ flowchart TD
 
 ### Sub-agent
 
-子 Agent 有自己的对话历史，复用父 Agent 的模型连接、工具实例、权限和 Hooks，默认最多 20 轮。它不再拥有 `agent` 工具，因此不能继续递归派生。
+子 Agent 使用同一套 LangGraph Agent 实现，有自己的执行图和对话历史，复用父 Agent 的模型对象、工具实例、权限和 Hooks，默认最多 20 轮。它不再拥有 `agent` 工具，因此不能继续递归派生。
 
 子 Agent 同步执行完后返回文本；过长结果会截短。独立的是对话历史，文件系统和部分工具状态仍然共享，没有自动创建容器或独立代码副本。
+
+当前仍是主 Agent 分派子任务的基础结构，没有新增研究、编码、评审等角色的复杂图编排。
 
 ### MCP 扩展
 
@@ -214,6 +260,8 @@ flowchart TD
 普通交互模式下，`read_file`、`glob`、`grep` 和 `todo_write` 默认直接执行。其他工具可以允许一次、按工具持续允许，或拒绝。持续许可保存在 `~/.corecoder/permissions.json`。
 
 直接作为 Python 库创建 `Agent(...)` 时，默认没有配置权限层；嵌入自己的程序时，需要显式传入合适的 `Permission`。
+
+这次迁移保留了上述原有交互，没有接入 LangGraph `interrupt`。审批回调仍在当前运行中完成，不支持把挂起的审批状态保存后跨进程继续执行。
 
 ### Token 与费用
 
@@ -252,6 +300,8 @@ corecoder -r <会话ID>
 corecoder -r <会话ID> -m qwen-flash
 ```
 
+当前保存的仍是 JSON 对话存档。图尚未配置持久化 checkpointer，恢复存档不等于恢复上一进程中某个挂起的图节点。文件撤销依旧由 `checkpoints.py` 的文件快照负责，与 LangGraph 图检查点是不同机制。
+
 一次性执行任务：
 
 ```bash
@@ -272,8 +322,10 @@ Hooks 配置保存在 `~/.corecoder/hooks.json`。PreToolUse 可用退出码 2 �
 corecoder-qwen/
 ├── corecoder/
 │   ├── cli.py             命令行入口与交互命令
-│   ├── agent.py           Agent 主循环与工具调度
-│   ├── llm.py             模型请求、流式返回、重试和统计
+│   ├── agent.py           LangGraph 状态图与工具调度
+│   ├── langchain_llm.py   ChatOpenAI 模型绑定、流式响应与兼容适配
+│   ├── langchain_tools.py StructuredTool 桥接
+│   ├── llm.py             响应类型、费用统计与旧模型适配兼容路径
 │   ├── config.py          .env 与环境变量配置
 │   ├── context.py         上下文压缩
 │   ├── prompt.py          系统提示词
@@ -297,24 +349,28 @@ corecoder-qwen/
 └── LICENSE                原始 MIT 许可证
 ```
 
-主要依赖：Python、`openai`、`rich`、`prompt_toolkit`、`python-dotenv`。开发工具为 pytest 和 Ruff，打包使用 Hatchling。LiteLLM 为可选依赖。
+主要依赖：Python、LangChain、LangGraph、`langchain-openai`、`openai`、`rich`、`prompt_toolkit`、`python-dotenv`。当前约束使用 LangChain / LangGraph 1.x 系列。开发工具为 pytest 和 Ruff，打包使用 Hatchling。LiteLLM 为可选依赖。
 
 ## 9. 验证情况与后续评估
 
 ### 已完成的本地验证
 
-以下为截至 2026-11-01 的实际检查记录：
+以下为截至 2026-11-02 的实际验证记录。测试环境为 Python 3.13，LangChain 1.4.7、langchain-openai 1.7.3、LangGraph 1.2.19：
 
 | 检查项 | 结果 |
 | --- | --- |
-| 项目虚拟环境与四项核心依赖 | 已确认可用 |
-| 命令行版本入口 | 返回 `corecoder 0.8.0` |
-| `.env` 配置加载 | 正确读取 `qwen-flash`、接口地址与密钥 |
-| 百炼模型请求 | 返回 HTTP 200，返回模型为 `qwen-flash` |
-| Agent 与工具协作 | 固定文本测试工具被实际调用，结果回传后模型正常回答 |
-| 双击启动脚本 | 已检查语法、执行权限和目标路径 |
+| LangChain 模型适配 | 离线测试已通过，覆盖流式消息、工具调用、usage 与模型切换 |
+| StructuredTool 适配 | 离线测试已通过，覆盖签名错误、默认参数、状态和 MCP 动态字段 |
+| LangGraph 主流程 | 离线测试已通过，覆盖节点路由、轮次预算、权限拒绝与调用反馈 |
+| 原有能力回归 | 已通过原有工具、权限、Hooks、上下文和会话等回归检查 |
+| 完整自动化测试 | `276 passed, 1 skipped`；跳过的是需显式开启的联网测试 |
+| 代码检查 | Ruff 通过 |
+| 临时示例文件任务 | 经真实执行图完成写入、读取、修改，并用 Python 运行断言通过；模型响应使用离线脚本 |
+| 原版 Qwen 联网验证 | 迁移前已返回 HTTP 200，并跑通固定文本工具调用 |
+| 迁移后 Qwen 联网验证 | 已通过：真实 `qwen-flash` 请求经 `ChatOpenAI`、`StateGraph` 和 `StructuredTool` 完成工具调用并返回回答 |
+| Qwen 只读联网任务 | 另行开启的联网测试 `1 passed`：通过受限 `read_file` 读取临时生成的测试文本并正确回答 |
 
-尚未对实际代码修改、Shell 测试执行、外部 MCP 服务、子 Agent 和长任务稳定性逐项完成端到端实测。也没有重新运行整个仓库的测试集。因此，当前记录只说明启动条件和核心调用链路可用。
+自动化回归使用模拟模型和隔离目录，不需要在测试中填写真实 API Key。离线通过说明接口和控制流程符合测试预期；不同模型实际修复代码的表现、外部 MCP 服务和长任务稳定性仍需另外验证。真实 Qwen 验证只使用固定文本工具和临时生成的测试文本，没有读取或发送本地项目源码；它验证模型与框架协作，不代表已经测得真实代码修复成功率。
 
 仓库保留测试和 CI 配置。上游自动发布 PyPI 包的工作流未包含在此展示版本中；当前仓库用于源码展示与本地运行。要在自己的环境中运行：
 
@@ -353,9 +409,10 @@ corecoder --demo
 - **回滚范围**：快照只追踪两个文件写入工具；Bash、外部 MCP 工具和其他进程造成的改动不在同一撤销范围内。
 - **任务规模**：文件搜索有扫描上限，未实现 RAG 或专门的大仓库代码索引。
 - **长任务与调度**：上下文压缩、同步子 Agent 和批量并行执行仍有局限，没有完整的任务依赖编排。
+- **图持久化**：已使用 LangGraph 执行流程，但没有配置图 checkpointer、`interrupt` 恢复或跨进程审批；当前会话保存仍走原有 JSON 接口。一个 Agent 实例用于一段顺序对话，不支持并发调用同一实例的 `chat()`。
 - **费用与故障处理**：没有金额硬预算和模型自动回退链，费用统计也依赖服务返回的 usage 与价格配置。
 
-后续优先考虑两件事：先补齐固定任务的验证记录，再根据失败原因选择改进点。例如，若用户频繁拒绝工具调用，就进一步研究授权信息是否足够清楚；若任务常在长对话中丢失目标，再调整上下文保留策略。
+后续优先补齐真实模型的固定任务验证，再根据失败原因选择改进点。需要跨进程恢复时，再接入持久化 checkpointer 与人工中断；需要更细的任务分工时，再设计多角色子图。框架提供这些能力，不代表本版本已经接入。
 
 ## 11. 参考资料与来源
 
@@ -368,9 +425,14 @@ corecoder --demo
 | [Claude Code 官方介绍](https://code.claude.com/docs/en/overview) | 了解编程 Agent 的产品使用方式与功能概念 |
 | [MCP 官方架构文档](https://modelcontextprotocol.io/docs/learn/architecture) | 理解 Host、Client、Server 和工具通信；具体支持范围以本项目实现为准 |
 | [阿里云百炼 OpenAI 兼容接口](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope) | 核对 Qwen 的模型接入方式、接口地址和密钥配置 |
+| [LangGraph Quickstart](https://docs.langchain.com/oss/python/langgraph/quickstart) | 参考模型节点、工具节点、条件边和状态图的组织方式 |
+| [LangChain ChatOpenAI](https://docs.langchain.com/oss/python/integrations/chat/openai) | 参考工具绑定、消息流和模型接口适配 |
+| [LangGraph Persistence](https://docs.langchain.com/oss/python/langgraph/persistence) | 后续图持久化方案的参考；当前版本尚未接入 checkpointer |
 | [nanoGPT · Karpathy](https://github.com/karpathy/nanoGPT) | 上游 README 对“少量、可读、可修改的核心实现”的定位类比，不是本项目运行依赖 |
 
 上游作者在源码分析文章中称，其研究对象包括泄露的 Claude Code 源码。这份分析属于上游参考资料，本版本以开源的 CoreCoder 源码为直接基础。
+
+`article/` 中的导读针对上游实现，属于保留的历史学习资料。迁移后 `agent.py` 和模型适配已发生变化，文章中的行数与代码片段可能不再对应当前版本，具体行为以当前源码和测试为准。
 
 ## 12. 开源许可
 

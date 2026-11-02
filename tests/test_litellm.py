@@ -203,9 +203,9 @@ class TestChat:
 
 
 class TestConfigProvider:
-    def test_default_provider_is_openai(self):
+    def test_default_provider_is_langchain(self):
         config = Config()
-        assert config.provider == "openai"
+        assert config.provider == "langchain"
 
     def test_provider_from_env(self):
         with mock.patch.dict("os.environ", {"CORECODER_PROVIDER": "litellm"}, clear=False):
