@@ -15,7 +15,9 @@ from . import __version__
 from .agent import Agent
 from .config import Config
 from .hooks import load_hooks
-from .llm import LLM, LiteLLM
+from .langchain_llm import LangChainLLM as LLM
+from .llm import LLM as LegacyLLM
+from .llm import LiteLLM
 from .mcp import load_mcp_tools
 from .permissions import DEFAULT_STORE, Permission
 from .session import list_sessions, load_session, save_session
@@ -74,14 +76,7 @@ def main():
         )
         sys.exit(1)
 
-    llm_cls = LiteLLM if config.provider == "litellm" else LLM
-    llm = llm_cls(
-        model=config.model,
-        api_key=config.api_key,
-        base_url=config.base_url,
-        temperature=config.temperature,
-        max_tokens=config.max_tokens,
-    )
+    llm = _create_llm(config)
     # consent layer: ask in the REPL, refuse in one-shot mode, --yes skips it
     if args.yes:
         permission = Permission(allow_all=True)
@@ -118,6 +113,24 @@ def main():
 
     # interactive REPL
     _repl(agent, config)
+
+
+def _create_llm(config: Config):
+    """Keep legacy backends explicit; compatible APIs use LangChain by default."""
+    if config.provider == "litellm":
+        llm_cls = LiteLLM
+    elif config.provider == "legacy":
+        llm_cls = LegacyLLM
+    else:
+        # "openai" remains a compatible configuration alias, not a separate engine.
+        llm_cls = LLM
+    return llm_cls(
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.base_url,
+        temperature=config.temperature,
+        max_tokens=config.max_tokens,
+    )
 
 
 def _ask_permission(tool_name: str, arguments: dict) -> str:

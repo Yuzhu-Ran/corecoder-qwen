@@ -3,8 +3,9 @@
 Skipped by default. Run it with a real key (OpenRouter works out of the box):
 
     CORECODER_LIVE_SMOKE=1 \
-    OPENAI_API_KEY=sk-or-... \
-    OPENAI_BASE_URL=https://openrouter.ai/api/v1 \
+    OPENAI_API_KEY=your-api-key \
+    OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
+    CORECODER_SMOKE_MODEL=qwen-flash \
     pytest tests/test_live_smoke.py -v
 
 Override the model with CORECODER_SMOKE_MODEL (pick something cheap).
@@ -19,7 +20,8 @@ from pathlib import Path
 import pytest
 
 from corecoder.agent import Agent
-from corecoder.llm import LLM
+from corecoder.langchain_llm import LangChainLLM
+from corecoder.tools.read import ReadFileTool
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("CORECODER_LIVE_SMOKE"),
@@ -33,13 +35,21 @@ def test_agent_reads_a_file_and_answers(tmp_path: Path) -> None:
     fixture = tmp_path / "fixture.txt"
     fixture.write_text(f"The magic phrase is {MAGIC}.\n")
 
-    llm = LLM(
-        model=os.environ.get("CORECODER_SMOKE_MODEL", "openai/gpt-4.1-mini"),
+    llm = LangChainLLM(
+        model=os.environ.get("CORECODER_SMOKE_MODEL", "qwen-flash"),
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ.get("OPENAI_BASE_URL") or None,
         timeout=90,
     )
-    agent = Agent(llm=llm, max_rounds=6)
+    class FixtureReadTool(ReadFileTool):
+        """Expose only the generated test file to the external model."""
+
+        def execute(self, file_path: str, offset: int = 1, limit: int = 2000) -> str:
+            if Path(file_path).resolve() != fixture.resolve():
+                return "Error: this test only permits the generated fixture file"
+            return super().execute(file_path, offset, limit)
+
+    agent = Agent(llm=llm, tools=[FixtureReadTool()], max_rounds=6)
 
     tools_used: list[str] = []
     reply = agent.chat(

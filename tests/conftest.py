@@ -3,8 +3,24 @@
 import pytest
 
 from corecoder import Config, checkpoints, cli
+from corecoder import config as config_module
 from corecoder import llm as llm_module
 from corecoder.tools import ALL_TOOLS
+
+
+@pytest.fixture(autouse=True)
+def _config_isolated(monkeypatch, request):
+    """Unit tests never load a developer's real .env or enable remote tracing."""
+    monkeypatch.setattr(config_module, "_load_dotenv", lambda: None)
+    monkeypatch.setenv("LANGSMITH_TRACING", "false")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
+    if request.path.name != "test_live_smoke.py":
+        for name in (
+            "CORECODER_MODEL", "CORECODER_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY",
+            "OPENAI_BASE_URL", "CORECODER_BASE_URL", "CORECODER_PROVIDER", "CORECODER_MAX_TOKENS",
+            "CORECODER_MAX_CONTEXT", "CORECODER_TEMPERATURE",
+        ):
+            monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)

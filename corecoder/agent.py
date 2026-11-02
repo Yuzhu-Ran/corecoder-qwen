@@ -1,18 +1,20 @@
-"""Core agent loop.
+"""LangGraph workflow for model calls, authorization and LangChain tools.
 
-This is the heart of CoreCoder.  The pattern is simple:
-
-    user message -> LLM (with tools) -> tool calls? -> execute -> loop
-                                      -> text reply? -> return to user
-
-It keeps looping until the LLM responds with plain text (no tool calls),
-which means it's done working and ready to report back.
+The public chat/history interface stays compatible with CoreCoder's CLI,
+session files and scripted demos. Graph state is per invocation; saved file
+snapshots and conversation persistence remain separate concerns.
 """
 
 import concurrent.futures
 import inspect
 
+from langchain_core.runnables import RunnableConfig
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langgraph.graph import END, START, StateGraph
+from typing_extensions import TypedDict
+
 from .context import ContextManager
+from .langchain_tools import adapt_tools
 from .llm import LLM
 from .permissions import Permission
 from .prompt import PLAN_MODE_PROMPT, system_prompt
@@ -20,6 +22,15 @@ from .tools import ALL_TOOLS
 from .tools.agent import AgentTool
 from .tools.base import Tool
 from .tools.todo import TodoWriteTool
+
+
+class AgentState(TypedDict, total=False):
+    messages: list[dict]
+    rounds: int
+    response: object
+    permissions: list[str | None]
+    cwd: str | None
+    output: str
 
 
 class Agent:
@@ -37,6 +48,7 @@ class Agent:
         self.permission = permission
         self.hooks = hooks
         self._tool_by_name = {t.name: t for t in self.tools}
+        self._langchain_tool_by_name = {t.name: t for t in adapt_tools(self.tools)}
         self.messages: list[dict] = []
         self.context = ContextManager(max_tokens=max_context_tokens)
         self.max_rounds = max_rounds
@@ -49,6 +61,9 @@ class Agent:
                 t._parent_agent = self
 
         self._todo = next((t for t in self.tools if isinstance(t, TodoWriteTool)), None)
+        self._pending_tool_calls = []
+        self._session_cwd = None
+        self.graph = self._build_graph()
 
     def _full_messages(self) -> list[dict]:
         system = self._system
@@ -65,63 +80,124 @@ class Agent:
         return [{"role": "system", "content": system}] + self.messages
 
     def _tool_schemas(self) -> list[dict]:
-        return [t.schema() for t in self.tools]
+        return [convert_to_openai_tool(t) for t in self._langchain_tool_by_name.values()]
 
     def chat(self, user_input: str, on_token=None, on_tool=None, on_reasoning=None) -> str:
-        """Process one user message. May involve multiple LLM/tool rounds."""
+        """Run a LangGraph invocation, retaining the conversation between turns."""
+        from .tools.bash import get_tracked_cwd, set_tracked_cwd
+
         self.messages.append({"role": "user", "content": user_input})
-        self.context.maybe_compress(self.messages, self.llm)
-
-        for _ in range(self.max_rounds):
-            resp = self.llm.chat(
-                messages=self._full_messages(),
-                tools=self._tool_schemas(),
-                on_token=on_token,
-                on_reasoning=on_reasoning,
+        self._pending_tool_calls = []
+        self._session_cwd = get_tracked_cwd()
+        try:
+            result = self.graph.invoke(
+                {"messages": self.messages, "rounds": 0, "cwd": self._session_cwd},
+                config={
+                    # max_rounds counts model calls, not graph transitions.
+                    "recursion_limit": max(16, self.max_rounds * 4 + 8),
+                    "configurable": {
+                        "on_token": on_token,
+                        "on_tool": on_tool,
+                        "on_reasoning": on_reasoning,
+                    },
+                },
             )
+            self.messages = result["messages"]
+            return result["output"]
+        except KeyboardInterrupt:
+            self._answer_pending_tool_calls(self._pending_tool_calls)
+            raise
+        finally:
+            # Graph nodes can run on worker threads; cwd must cross that edge.
+            set_tracked_cwd(self._session_cwd)
 
-            # no tool calls -> LLM is done, return text
-            if not resp.tool_calls:
-                self.messages.append(resp.message)
-                return resp.content
+    def _build_graph(self):
+        builder = StateGraph(AgentState)
+        builder.add_node("prepare", self._prepare_node)
+        builder.add_node("model", self._model_node)
+        builder.add_node("authorize", self._authorize_node)
+        builder.add_node("tools", self._tools_node)
+        builder.add_node("compact", self._compact_node)
+        builder.add_node("limit", self._limit_node)
+        builder.add_edge(START, "prepare")
+        builder.add_conditional_edges("prepare", self._next_round, {"model": "model", "limit": "limit"})
+        builder.add_conditional_edges("model", self._after_model, {"tools": "authorize", "done": END})
+        builder.add_edge("authorize", "tools")
+        builder.add_edge("tools", "compact")
+        builder.add_conditional_edges("compact", self._next_round, {"model": "model", "limit": "limit"})
+        builder.add_edge("limit", END)
+        return builder.compile()
 
-            # tool calls -> execute (parallel when multiple, like Claude Code's
-            # StreamingToolExecutor which runs independent tools concurrently)
-            self.messages.append(resp.message)
+    def _prepare_node(self, state: AgentState) -> dict:
+        self.messages = state["messages"]
+        self.context.maybe_compress(self.messages, self.llm)
+        return {"messages": self.messages}
 
-            try:
-                if len(resp.tool_calls) == 1:
-                    tc = resp.tool_calls[0]
-                    if on_tool:
-                        on_tool(tc.name, tc.arguments)
-                    result = self._pre_hooks(tc) or self._permit(tc)
-                    if result is None:
-                        result = self._exec_tool(tc)
-                        self._post_hooks(tc, result)
-                    self.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result,
-                    })
-                else:
-                    # parallel execution for multiple tool calls
-                    results = self._exec_tools_parallel(resp.tool_calls, on_tool)
-                    for tc, result in zip(resp.tool_calls, results):
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result,
-                        })
-            except KeyboardInterrupt:
-                # Ctrl+C mid-execution would leave the assistant tool_calls
-                # message without replies, poisoning the next request; backfill
-                self._answer_pending_tool_calls(resp.tool_calls)
-                raise
+    def _model_node(self, state: AgentState, config: RunnableConfig) -> dict:
+        self.messages = state["messages"]
+        callbacks = config.get("configurable", {})
+        response = self.llm.chat(
+            messages=self._full_messages(),
+            tools=self._tool_schemas(),
+            on_token=callbacks.get("on_token"),
+            on_reasoning=callbacks.get("on_reasoning"),
+        )
+        self.messages.append(response.message)
+        self._pending_tool_calls = response.tool_calls
+        return {
+            "messages": self.messages,
+            "rounds": state["rounds"] + 1,
+            "response": response,
+            "output": response.content,
+        }
 
-            # compress if tool outputs are big
-            self.context.maybe_compress(self.messages, self.llm)
+    def _authorize_node(self, state: AgentState, config: RunnableConfig) -> dict:
+        calls = state["response"].tool_calls
+        on_tool = config.get("configurable", {}).get("on_tool")
+        for call in calls:
+            if on_tool:
+                on_tool(call.name, call.arguments)
+        # All consent is settled before starting parallel tool workers.
+        return {"permissions": [self._pre_hooks(tc) or self._permit(tc) for tc in calls]}
 
-        return "(reached maximum tool-call rounds)"
+    def _tools_node(self, state: AgentState) -> dict:
+        from .tools.bash import get_tracked_cwd, set_tracked_cwd
+
+        self.messages = state["messages"]
+        calls = state["response"].tool_calls
+        set_tracked_cwd(state.get("cwd"))
+        try:
+            if len(calls) == 1:
+                tc = calls[0]
+                result = state["permissions"][0]
+                if result is None:
+                    result = self._exec_tool(tc)
+                    self._post_hooks(tc, result)
+                results = [result]
+            else:
+                results = self._exec_tools_parallel(calls, prechecked=state["permissions"])
+            for tc, result in zip(calls, results):
+                self.messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            self._pending_tool_calls = []
+            return {"messages": self.messages, "cwd": get_tracked_cwd()}
+        finally:
+            self._session_cwd = get_tracked_cwd()
+
+    def _compact_node(self, state: AgentState) -> dict:
+        self.messages = state["messages"]
+        self.context.maybe_compress(self.messages, self.llm)
+        return {"messages": self.messages}
+
+    def _next_round(self, state: AgentState) -> str:
+        return "limit" if state["rounds"] >= self.max_rounds else "model"
+
+    @staticmethod
+    def _after_model(state: AgentState) -> str:
+        return "tools" if state["response"].tool_calls else "done"
+
+    @staticmethod
+    def _limit_node(state: AgentState) -> dict:
+        return {"output": "(reached maximum tool-call rounds)"}
 
     def _pre_hooks(self, tc) -> str | None:
         """PreToolUse hooks, fired before consent. A string return blocks the
@@ -163,11 +239,11 @@ class Agent:
             return f"Error: bad arguments for {tc.name}: {e}"
         # a tool that blows up gets reported back as text, never kills the loop
         try:
-            return tool.execute(**tc.arguments)
+            return self._langchain_tool_by_name[tc.name].invoke(tc.arguments)
         except Exception as e:  # noqa: BLE001
             return f"Error executing {tc.name}: {e}"
 
-    def _exec_tools_parallel(self, tool_calls, on_tool=None) -> list[str]:
+    def _exec_tools_parallel(self, tool_calls, on_tool=None, prechecked=None) -> list[str]:
         """Run multiple tool calls concurrently using threads.
 
         This is inspired by Claude Code's StreamingToolExecutor which starts
@@ -176,13 +252,13 @@ class Agent:
         """
         from .tools.bash import get_tracked_cwd, set_tracked_cwd
 
-        for tc in tool_calls:
-            if on_tool:
-                on_tool(tc.name, tc.arguments)
-
-        # hooks and consent are settled up front on this thread: prompting
-        # from pool workers would interleave several prompts on one terminal
-        results = [self._pre_hooks(tc) or self._permit(tc) for tc in tool_calls]
+        if prechecked is None:
+            for tc in tool_calls:
+                if on_tool:
+                    on_tool(tc.name, tc.arguments)
+            results = [self._pre_hooks(tc) or self._permit(tc) for tc in tool_calls]
+        else:
+            results = list(prechecked)
         # the tracked cwd is thread-local, so pool workers would otherwise
         # start from the launch directory: hand the session cwd in, and merge
         # any cd back in call order so the batch behaves like a sequence
@@ -190,8 +266,9 @@ class Agent:
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             def run(i, tc, base_cwd):
                 is_bash = tc.name == "bash"
-                if is_bash and base_cwd is not None:
-                    set_tracked_cwd(base_cwd)
+                # AgentTool can launch a child graph from this worker too.
+                # Every worker inherits the session cwd; only Bash reports cd.
+                set_tracked_cwd(base_cwd)
                 out = self._exec_tool(tc)
                 if not is_bash:
                     return i, out, None
